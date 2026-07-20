@@ -37,7 +37,7 @@ if (!TOKEN) {
 }
 const CERT = process.env.CERT || "";                   // https 证书 fullchain 路径（留空=http）
 const KEY = process.env.KEY || "";                     // https 私钥路径
-const DATA_FILE = path.join(__dirname, "loc.json");
+const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, "loc.json");
 
 // 常量时间比较，避免通过响应时延逐字节爆破 token
 function safeEqual(a, b) {
