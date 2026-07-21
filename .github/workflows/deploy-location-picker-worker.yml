@@ -5,7 +5,7 @@ on:
     branches:
       - main
     paths:
-      - "location-picker/worker/**"
+      - "location-picker/cloudflare-webui/worker.js"
       - ".github/workflows/deploy-location-picker-worker.yml"
   workflow_dispatch:
 
@@ -47,7 +47,7 @@ jobs:
 
           const config = {
             name: 'ios-location-picker',
-            main: 'src/index.js',
+            main: '../cloudflare-webui/worker.js',
             compatibility_date: '2026-01-01',
             workers_dev: true,
             kv_namespaces: [
