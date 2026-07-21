@@ -7,6 +7,8 @@ const workflowPath = new URL(
   import.meta.url,
 );
 const workflow = await readFile(workflowPath, "utf8");
+const packagePath = new URL("../package.json", import.meta.url);
+const packageSource = await readFile(packagePath, "utf8");
 
 test("deploy workflow runs from the standalone Cloudflare WebUI directory", () => {
   assert.match(
@@ -55,4 +57,14 @@ test("deploy workflow smoke tests after deployment", () => {
   assert.notEqual(deployStep, -1);
   assert.notEqual(smokeStep, -1);
   assert.ok(deployStep < smokeStep);
+});
+
+test("standalone deployment files contain local paths only", () => {
+  const legacyDirectory = ["location-picker", "worker"].join("/");
+  const parentWorkerPath = ["..", "worker"].join("/");
+
+  assert.doesNotMatch(workflow, new RegExp(legacyDirectory));
+  assert.doesNotMatch(workflow, new RegExp(parentWorkerPath.replace("..", "\\.\\.")));
+  assert.doesNotMatch(packageSource, new RegExp(legacyDirectory));
+  assert.doesNotMatch(packageSource, new RegExp(parentWorkerPath.replace("..", "\\.\\.")));
 });

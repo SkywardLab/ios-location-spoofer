@@ -1,6 +1,4 @@
-// 与 location-picker/server.js 的 PAGE 保持一致（地图选点 UI）
-// ⚠️ 本文件由 worker/src/page.js + worker/src/index.js 合并生成，请勿手改；
-//    要改逻辑请改 worker/src/ 再重新合并，避免多份副本漂移。
+// Independently maintained Cloudflare WebUI Worker.
 
 export const PAGE = `<!doctype html>
 <html lang="zh">
