@@ -2,8 +2,8 @@
 
 这是一份给新手看的 Cloudflare Worker 网页后台部署教程。它不要求本地安装 Node.js、npm 或 Wrangler，也不要求理解多文件 Worker 项目结构。
 
-如果你会命令行，推荐使用 [`../worker/`](../worker/) 里的 Wrangler 部署方式。  
-如果你只想在 Cloudflare 网页后台复制粘贴，请使用本目录的单文件 Worker：
+命令行部署可在本目录运行 `npm ci` 和 `npm run deploy`。
+Cloudflare 网页后台部署可直接复制本目录的单文件 Worker：
 
 ```text
 location-picker/cloudflare-webui/worker.js
