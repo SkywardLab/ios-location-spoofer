@@ -1,4 +1,7 @@
 /*
+ * iOS 12 compatibility build. The protobuf int64 implementation deliberately
+ * avoids BigInt syntax so JavaScriptCore on iOS 12 can parse this file.
+ *
  * 拦截 Apple /clls/wloc 接口的回应，解 ARPC 封包，改 WiFi 热点和基站坐标，
  * 再按 Apple 的格式封回去返回给系统。
  *
@@ -35,18 +38,12 @@
   // Stable marker that precedes the AppleWLoc protobuf inside a REAL Apple /clls/wloc
   // response. After the marker come 2 bytes (uint16 BE payload length) then the payload.
   var APPLE_WLOC_MARKER = bytesFromArray([0x00, 0x00, 0x00, 0x01, 0x00, 0x00]);
-  var ROOT_DROP_FIELDS = { 3: true, 4: true, 33: true };
+  var ROOT_DROP_FIELDS = {};
   var CELL_RESPONSE_FIELDS = { 22: true, 24: true };
-  var LOCATION_REPLACED_FIELDS = {
-    1: true,
-    2: true,
-    3: true,
-    4: true,
-    5: true,
-    6: true,
-    11: true,
-    12: true
-  };
+  // 位置子消息只改写 纬度(1)/经度(2)/精度(3)，其余字段（海拔、垂直精度、
+  // 运动状态、unknown 等）一律原样透传——改写或新增的字段越多，越容易被
+  // iOS 判定为非法响应，导致 “定位不可用”。
+  var LOCATION_REPLACED_FIELDS = { 1: true, 2: true, 3: true };
 
   function bytesFromArray(values) {
     return new Uint8Array(values);
@@ -238,52 +235,127 @@
     return out;
   }
 
-  function encodeVarintUnsigned(value) {
-    var v = typeof value === "bigint" ? value : BigInt(value);
-    if (v < 0n) {
-      throw new Error("negative unsigned varint");
+  // iOS 12 JavaScriptCore cannot parse BigInt literals. Represent uint64 values
+  // as unsigned high/low 32-bit words so negative coordinates still use the
+  // canonical 10-byte protobuf int64 encoding.
+  var UINT32_BASE = 4294967296;
+  var MAX_SAFE_INTEGER = 9007199254740991;
+
+  function uint64FromUnsignedNumber(value) {
+    var number = Number(value);
+    if (!Number.isFinite(number) || number < 0 || Math.floor(number) !== number || number > MAX_SAFE_INTEGER) {
+      throw new Error("invalid unsigned varint value: " + value);
+    }
+    return {
+      low: number >>> 0,
+      high: Math.floor(number / UINT32_BASE) >>> 0
+    };
+  }
+
+  function uint64FromSignedNumber(value) {
+    var number = Math.trunc(Number(value));
+    if (!Number.isFinite(number) || Math.abs(number) > MAX_SAFE_INTEGER) {
+      throw new Error("invalid signed int64 value: " + value);
+    }
+    if (number >= 0) {
+      return uint64FromUnsignedNumber(number);
     }
 
-    var out = [];
-    while (v >= 0x80n) {
-      out.push(Number((v & 0x7fn) | 0x80n));
-      v >>= 7n;
+    var magnitude = uint64FromUnsignedNumber(-number);
+    var low = (~magnitude.low + 1) >>> 0;
+    var carry = low === 0 ? 1 : 0;
+    return {
+      low: low,
+      high: (~magnitude.high + carry) >>> 0
+    };
+  }
+
+  function uint64ToSafeNumber(words) {
+    var value = (words.high >>> 0) * UINT32_BASE + (words.low >>> 0);
+    if (value > MAX_SAFE_INTEGER) {
+      throw new Error("uint64 exceeds safe integer range");
     }
-    out.push(Number(v));
+    return value;
+  }
+
+  function uint64ToSignedNumber(words) {
+    var low = words.low >>> 0;
+    var high = words.high >>> 0;
+    if ((high & 0x80000000) === 0) {
+      return uint64ToSafeNumber({ low: low, high: high });
+    }
+
+    var magnitudeLow = (~low + 1) >>> 0;
+    var carry = magnitudeLow === 0 ? 1 : 0;
+    var magnitudeHigh = (~high + carry) >>> 0;
+    var magnitude = magnitudeHigh * UINT32_BASE + magnitudeLow;
+    if (magnitude > MAX_SAFE_INTEGER) {
+      throw new Error("int64 exceeds safe integer range");
+    }
+    return -magnitude;
+  }
+
+  function encodeVarintWords(words) {
+    var low = words.low >>> 0;
+    var high = words.high >>> 0;
+    var out = [];
+
+    while (high !== 0 || low >= 0x80) {
+      out.push((low & 0x7f) | 0x80);
+      low = ((low >>> 7) | (high << 25)) >>> 0;
+      high = high >>> 7;
+    }
+    out.push(low & 0x7f);
     return bytesFromArray(out);
   }
 
+  function encodeVarintUnsigned(value) {
+    return encodeVarintWords(uint64FromUnsignedNumber(value));
+  }
+
   function encodeVarintSignedInt64(value) {
-    var v = typeof value === "bigint" ? value : BigInt(Math.trunc(value));
-    if (v < 0n) {
-      v = BigInt.asUintN(64, v);
-    }
-    return encodeVarintUnsigned(v);
+    return encodeVarintWords(uint64FromSignedNumber(value));
   }
 
   function decodeVarint(bytes, offset) {
-    var result = 0n;
-    var shift = 0n;
+    var low = 0;
+    var high = 0;
+    var shift = 0;
     var current = offset;
+    var count = 0;
 
-    while (current < bytes.length) {
+    while (current < bytes.length && count < 10) {
       var b = bytes[current];
+      var payload = b & 0x7f;
       current += 1;
-      result |= BigInt(b & 0x7f) << shift;
+      count += 1;
+
+      if (shift < 32) {
+        low = (low | ((payload << shift) >>> 0)) >>> 0;
+        if (shift > 25) {
+          high = (high | (payload >>> (32 - shift))) >>> 0;
+        }
+      } else {
+        if (shift === 63 && payload > 1) {
+          throw new Error("varint exceeds uint64 range");
+        }
+        high = (high | ((payload << (shift - 32)) >>> 0)) >>> 0;
+      }
+
       if ((b & 0x80) === 0) {
-        return { value: result, offset: current };
+        return { low: low, high: high, offset: current };
       }
-      shift += 7n;
-      if (shift > 70n) {
-        throw new Error("varint too long");
-      }
+      shift += 7;
     }
 
+    if (count >= 10) {
+      throw new Error("varint too long");
+    }
     throw new Error("unterminated varint");
   }
 
   function makeKey(fieldNumber, wireType) {
-    return encodeVarintUnsigned((BigInt(fieldNumber) << 3n) | BigInt(wireType));
+    return encodeVarintUnsigned(fieldNumber * 8 + wireType);
   }
 
   function makeVarintField(fieldNumber, value) {
@@ -303,8 +375,9 @@
       var key = decodeVarint(bytes, offset);
       offset = key.offset;
 
-      var fieldNumber = Number(key.value >> 3n);
-      var wireType = Number(key.value & 0x7n);
+      var keyValue = uint64ToSafeNumber(key);
+      var fieldNumber = Math.floor(keyValue / 8);
+      var wireType = keyValue & 0x7;
       if (fieldNumber === 0) {
         throw new Error("protobuf field number 0");
       }
@@ -317,7 +390,7 @@
         valueEnd = offset + 8;
       } else if (wireType === 2) {
         var lengthInfo = decodeVarint(bytes, offset);
-        var length = Number(lengthInfo.value);
+        var length = uint64ToSafeNumber(lengthInfo);
         valueStart = lengthInfo.offset;
         valueEnd = valueStart + length;
       } else if (wireType === 5) {
@@ -359,7 +432,7 @@
     if (!field || field.wireType !== 0) {
       return null;
     }
-    return BigInt.asIntN(64, decodeVarint(field.valueBytes, 0).value);
+    return uint64ToSignedNumber(decodeVarint(field.valueBytes, 0));
   }
 
   function locationSummary(locationPayload) {
@@ -370,7 +443,7 @@
       if (lat == null || lon == null) {
         return "<missing>";
       }
-      return (Number(lat) / 100000000).toFixed(8) + "," + (Number(lon) / 100000000).toFixed(8);
+      return (lat / 100000000).toFixed(8) + "," + (lon / 100000000).toFixed(8);
     } catch (err) {
       return "<parse-failed:" + err.message + ">";
     }
@@ -475,42 +548,47 @@
   }
 
   function patchLocation(locationPayload, config) {
+    // 最小改写：只替换已存在的 纬度(1)/经度(2)/精度(3)，不改动、不新增任何其他字段。
+    // 若该位置子消息连纬度或经度都没有（不是我们要的目标），原样放行，避免塞数据
+    // 把响应写坏导致 iOS “定位不可用”。
     var parts = [];
     var fields = locationPayload.length ? parseFields(locationPayload) : [];
-    for (var i = 0; i < fields.length; i += 1) {
-      if (!LOCATION_REPLACED_FIELDS[fields[i].fieldNumber]) {
-        parts.push(fields[i].raw);
+    var hasLat = false;
+    var hasLon = false;
+    var i;
+    for (i = 0; i < fields.length; i += 1) {
+      if (fields[i].fieldNumber === 1 && fields[i].wireType === 0) hasLat = true;
+      if (fields[i].fieldNumber === 2 && fields[i].wireType === 0) hasLon = true;
+    }
+    if (!hasLat || !hasLon) {
+      return locationPayload;
+    }
+    for (i = 0; i < fields.length; i += 1) {
+      var field = fields[i];
+      if (field.fieldNumber === 1 && field.wireType === 0) {
+        parts.push(makeVarintField(1, coordToInt(config.latitude)));
+      } else if (field.fieldNumber === 2 && field.wireType === 0) {
+        parts.push(makeVarintField(2, coordToInt(config.longitude)));
+      } else if (field.fieldNumber === 3 && field.wireType === 0) {
+        parts.push(makeVarintField(3, config.horizontalAccuracy));
+      } else {
+        parts.push(field.raw);
       }
     }
-
-    parts.push(makeVarintField(1, coordToInt(config.latitude)));
-    parts.push(makeVarintField(2, coordToInt(config.longitude)));
-    parts.push(makeVarintField(3, config.horizontalAccuracy));
-    parts.push(makeVarintField(4, config.unknownValue4));
-    parts.push(makeVarintField(5, config.altitude));
-    parts.push(makeVarintField(6, config.verticalAccuracy));
-    parts.push(makeVarintField(11, config.motionActivityType));
-    parts.push(makeVarintField(12, config.motionActivityConfidence));
     return concatBytes(parts);
   }
 
   function patchWifiDevice(wifiPayload, config) {
     var fields = parseFields(wifiPayload);
     var parts = [];
-    var patchedLocation = false;
 
     for (var i = 0; i < fields.length; i += 1) {
       var field = fields[i];
       if (field.fieldNumber === 2 && field.wireType === 2) {
         parts.push(makeLengthDelimitedField(2, patchLocation(field.valueBytes, config)));
-        patchedLocation = true;
       } else {
         parts.push(field.raw);
       }
-    }
-
-    if (!patchedLocation) {
-      parts.push(makeLengthDelimitedField(2, patchLocation(bytesFromArray([]), config)));
     }
 
     return concatBytes(parts);
@@ -519,20 +597,14 @@
   function patchCellTower(cellPayload, config) {
     var fields = parseFields(cellPayload);
     var parts = [];
-    var patchedLocation = false;
 
     for (var i = 0; i < fields.length; i += 1) {
       var field = fields[i];
       if (field.fieldNumber === 5 && field.wireType === 2) {
         parts.push(makeLengthDelimitedField(5, patchLocation(field.valueBytes, config)));
-        patchedLocation = true;
       } else {
         parts.push(field.raw);
       }
-    }
-
-    if (!patchedLocation) {
-      parts.push(makeLengthDelimitedField(5, patchLocation(bytesFromArray([]), config)));
     }
 
     return concatBytes(parts);
@@ -552,7 +624,8 @@
       } else if (isCellResponseField(field.fieldNumber) && field.wireType === 2) {
         parts.push(makeLengthDelimitedField(field.fieldNumber, patchCellTower(field.valueBytes, config)));
         cellCount += 1;
-      } else if (!ROOT_DROP_FIELDS[field.fieldNumber]) {
+      } else {
+        // 根级其余字段一律原样保留，避免丢弃 iOS 校验所依赖的信息
         parts.push(field.raw);
       }
     }
@@ -750,12 +823,57 @@
     };
   }
 
-  function spoofAppleResponse(responseBytes, configInput) {
-    var config = normalizeConfig(configInput);
-    var extraction = extractAppleWLocPayload(responseBytes);
-    var patched = patchAppleWLocPayload(extraction.payload, config);
-    var response;
+  // wloc 式原始字节扫描兜底。
+  // 适用场景：iOS 26/27 beta5/beta6 及以后，Apple 若改动 /clls/wloc 响应的封装格式，
+  // 已知格式（ARPC / synthetic / marker / bare）都解析不了，脚本会直接 failOpen 放行 = 定位不生效。
+  // 此时直接在响应缓冲区里逐字节找“可改写的 WLOC protobuf”（wifi 设备 field 2 / 基站 field 22/24），
+  // 找到就把坐标改掉，并用标准 synthetic 封包返回。与 wloc 的 dist 脚本行为一致。
+  function scanPatchAppleWLoc(responseBytes, config) {
+    if (!responseBytes || responseBytes.length < 8) {
+      throw new Error("body too short for raw scan: " + (responseBytes ? responseBytes.length : 0));
+    }
+    var offsets = [];
+    var i;
+    var frameLimit = Math.min(96, Math.max(0, responseBytes.length - 10));
+    for (i = 0; i <= frameLimit; i += 2) {
+      offsets.push(i);
+    }
+    var rawLimit = Math.min(256, Math.max(0, responseBytes.length - 4));
+    for (i = 0; i <= rawLimit; i += 1) {
+      if (offsets.indexOf(i) < 0) {
+        offsets.push(i);
+      }
+    }
+    var errs = [];
+    for (i = 0; i < offsets.length; i += 1) {
+      var offset = offsets[i];
+      try {
+        var slice = responseBytes.slice(offset);
+        if (!looksLikeAppleWLocPayload(slice)) {
+          continue;
+        }
+        var patched = patchAppleWLocPayload(slice, config);
+        if (patched.wifiCount > 0 || patched.cellCount > 0) {
+          return {
+            response: buildAppleWLocResponse(patched.payload),
+            payload: patched.payload,
+            wifiCount: patched.wifiCount,
+            cellCount: patched.cellCount,
+            kind: "raw",
+            offset: offset
+          };
+        }
+      } catch (err) {
+        if (errs.length < 6) {
+          errs.push("@" + offset + ":" + err.message);
+        }
+      }
+    }
+    throw new Error("raw scan found no patchable WLoc payload" + (errs.length ? ("; " + errs.join(" | ")) : ""));
+  }
 
+  function buildPatchedResponse(extraction, patched, config) {
+    var response;
     if (extraction.kind === "arpc") {
       // Write back in ARPC format, preserving the original envelope metadata.
       var arpcOut = {
@@ -781,7 +899,6 @@
       // synthetic / bare – use the simple prefix format.
       response = buildAppleWLocResponse(patched.payload, extraction.prefix);
     }
-
     return {
       response: response,
       payload: patched.payload,
@@ -789,6 +906,37 @@
       cellCount: patched.cellCount,
       kind: extraction.kind,
       prefix: extraction.prefix ? hexPreview(extraction.prefix, 8) : ""
+    };
+  }
+
+  function spoofAppleResponse(responseBytes, configInput) {
+    var config = normalizeConfig(configInput);
+    var extraction = null;
+    var strictError = null;
+    try {
+      extraction = extractAppleWLocPayload(responseBytes);
+    } catch (err) {
+      strictError = err;
+    }
+
+    if (extraction) {
+      var patched = patchAppleWLocPayload(extraction.payload, config);
+      if (patched.wifiCount > 0 || patched.cellCount > 0) {
+        return buildPatchedResponse(extraction, patched, config);
+      }
+      strictError = new Error("no patchable location fields via " + extraction.kind);
+    }
+
+    // 已知封装格式都匹配/改不到 → 原始字节扫描兜底（应对 iOS 26/27 beta5/beta6 响应封装变化）
+    var raw = scanPatchAppleWLoc(responseBytes, config);
+    return {
+      response: raw.response,
+      payload: raw.payload,
+      wifiCount: raw.wifiCount,
+      cellCount: raw.cellCount,
+      kind: raw.kind,
+      offset: raw.offset,
+      strictError: strictError ? strictError.message : null
     };
   }
 
